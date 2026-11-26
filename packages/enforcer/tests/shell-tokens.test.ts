@@ -10,6 +10,7 @@ import {
 	tokenizeCommandForFloor,
 	tokenizeCommandRuns,
 } from "../src/shell-tokens.js";
+import { expectScaling, SCALING_TEST_TIMEOUT_MS } from "./perf-bound.js";
 
 /** The runs at the top level only: a zero budget suppresses the descent. */
 function top(source: string): string[][] {
@@ -550,21 +551,47 @@ describe("tokenizeCommandRuns - stays linear on adversarial input", () => {
 		// no closer would expose any backtracking in it.
 		["open brackets before a substitution", (n) => `echo ${"[a ".repeat(n)}'$(x)'`],
 	];
+	// The ratio compares an eighth of the size each shape names, not half of it. Two reasons. These
+	// shapes nest, and cost grows a little faster than linear below the nest budget (measured about
+	// n^1.4), so a bound tight to a pure straight line would fail on shapes that are fine; and the gap
+	// between n^1.4 and a quadratic widens with the step, being step^(2-exp), so a step of 8 separates
+	// them by 2.8x where a doubling separates them by only 1.4x. At a step of 8 a straight line costs 8
+	// and a quadratic 64, hence the bound of 32, with the worst shape across the loop measuring 17.8 and
+	// the median 10.0. The cap also shows up here as ratios under 1 on the shapes that hit it, which is
+	// the cap working.
 	for (const [label, build] of shapes) {
-		test(`${label} stays linear at 5000 tokens`, () => {
-			const started = Date.now();
-			tokenizeCommandRuns(build(5000));
-			expect(Date.now() - started).toBeLessThan(1000);
-		});
+		test(
+			`${label} stays linear at 5000 tokens`,
+			() =>
+				expectScaling({
+					build,
+					run: tokenizeCommandRuns,
+					size: 5000,
+					ceilingMs: 8000,
+					ratioPair: [625, 5000],
+					maxRatio: 32,
+				}),
+			SCALING_TEST_TIMEOUT_MS,
+		);
 	}
 	// Each nested operand's own analysis reads its definitions again, so without reading every
-	// source once the pre-walk read goes cubic in the depth. Kept under the nest budget, where
-	// that shows; past it every depth costs the same.
-	test("nested eval definitions stay linear at 600 levels", () => {
-		const started = Date.now();
-		tokenizeCommandRuns(`${"eval ".repeat(600)}'f() { :; }'; echo x | cat`);
-		expect(Date.now() - started).toBeLessThan(1000);
-	});
+	// source once the pre-walk read goes cubic in the depth. Kept under the nest budget, where that
+	// shows; past it every depth costs the same. Cost is quadratic in depth here by construction
+	// (measured 16.2 across the 150 -> 600 step, which is the 16 a quadratic owes), so this shape's
+	// bound is the cubic signature it exists to catch, 64 at this step, at 32 halfway between them.
+	test(
+		"nested eval definitions stay sub-cubic at 600 levels",
+		() =>
+			expectScaling({
+				build: (levels) => `${"eval ".repeat(levels)}'f() { :; }'; echo x | cat`,
+				run: tokenizeCommandRuns,
+				size: 600,
+				ceilingMs: 8000,
+				ratioPair: [150, 600],
+				maxRatio: 32,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 // Each expected list is what bash 5.2 printed for the word (`printf '<%s>' WORD`).
@@ -656,13 +683,23 @@ describe("expandBraces", () => {
 		for (const content of ["a..1", "a,b", "1..99999999999999999999", "1..3..-9223372036854775808"])
 			expect(braceSequenceStart(content)).toBeNull();
 	});
-	test("stays linear on braces that never match", () => {
-		for (const word of [`${"{".repeat(50_000)}}`, `${"{a}".repeat(20_000)},}`, `${"{a,".repeat(20_000)}}`]) {
-			const started = Date.now();
-			expandBraces(word, 100_000);
-			expect(Date.now() - started).toBeLessThan(3000);
-		}
-	});
+	test(
+		"stays linear on braces that never match",
+		() =>
+			expectScaling({
+				build: (units) => {
+					const open = 10 * units;
+					const pairs = 4 * units;
+					return [`${"{".repeat(open)}}`, `${"{a}".repeat(pairs)},}`, `${"{a,".repeat(pairs)}}`];
+				},
+				run: (words) => {
+					for (const word of words) expandBraces(word, 100_000);
+				},
+				size: 5000,
+				ceilingMs: 24000,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("staticWordMatches", () => {
@@ -679,10 +716,21 @@ describe("staticWordMatches", () => {
 		for (const word of ["{sed", "sed}", "{x,y}sed", "s{a..c}d", "{sed}", "sedx", "/sed/x", "s{e..{e,e}}d"])
 			expect(staticWordMatches(word, "sed")).toBe(false);
 	});
-	test("a large product with a real alternative matches without enumerating it", () => {
-		const started = Date.now();
-		expect(staticWordMatches(`${"{a,b}".repeat(40)}/{sed,x}`, "sed")).toBe(true);
-		expect(staticWordMatches(`${"{a,b}".repeat(40)}/{sex,x}`, "sed")).toBe(false);
-		expect(Date.now() - started).toBeLessThan(1000);
-	});
+	test(
+		"a large product with a real alternative matches without enumerating it",
+		() =>
+			expectScaling({
+				build: (groups) => ({
+					matched: `${"{a,b}".repeat(groups)}/{sed,x}`,
+					unmatched: `${"{a,b}".repeat(groups)}/{sex,x}`,
+				}),
+				run: ({ matched, unmatched }) => {
+					expect(staticWordMatches(matched, "sed")).toBe(true);
+					expect(staticWordMatches(unmatched, "sed")).toBe(false);
+				},
+				size: 40,
+				ceilingMs: 8000,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { analyzeShellCommand } from "../src/shell-tokens.js";
+import { expectScaling, SCALING_TEST_TIMEOUT_MS } from "./perf-bound.js";
 
 describe("analyzeShellCommand", () => {
 	test("preserves top-level command order and control operators", () => {
@@ -82,12 +83,17 @@ describe("analyzeShellCommand", () => {
 		}
 	});
 
-	test("stays linear on nested unsupported parameter expansions", () => {
-		const command = `echo ${"${".repeat(5000)}x${"}".repeat(5000)}`;
-		const started = Date.now();
-		expect(analyzeShellCommand(command).complete).toBe(false);
-		expect(Date.now() - started).toBeLessThan(1000);
-	});
+	test(
+		"stays linear on nested unsupported parameter expansions",
+		() =>
+			expectScaling({
+				build: (depth) => `echo ${"${".repeat(depth)}x${"}".repeat(depth)}`,
+				run: (command) => expect(analyzeShellCommand(command).complete).toBe(false),
+				size: 5000,
+				ceilingMs: 8000,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 
 	test("marks exhausted nested work incomplete", () => {
 		const analysis = analyzeShellCommand('sh -c "git status && git push"', 0);

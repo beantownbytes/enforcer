@@ -4,6 +4,7 @@ import { DEFAULT_HARD_DENY_ARGV } from "../src/argv-deny.js";
 import { compileRegexRules } from "../src/config.js";
 import { denyTarget, matchesHardDeny } from "../src/hard-deny.js";
 import type { CompiledHardDenyRule, HardDenyRule } from "../src/types.js";
+import { expectScaling, SCALING_TEST_TIMEOUT_MS } from "./perf-bound.js";
 
 // The real compile path: the built-in argv floor followed by any user regex rules, exactly
 // as config.loadRules assembles it. Constructing from one source would silently omit part
@@ -452,7 +453,9 @@ describe("matchesHardDeny - argv arrangements a raw-text scan cannot reach", () 
 // The floor runs synchronously on every tool call and cannot be overridden, so a rule that
 // degrades on long input is a denial of service on the whole gate -- the same property the
 // regexes it replaces were tuned for. Re-scanning the run from every command head would be
-// quadratic, and a command run repeating `rm` or `git push` is trivial to produce.
+// quadratic, and a command run repeating `rm` or `git push` is trivial to produce. The bound is
+// the cost ratio across a size step -- an eighth of the size against the full size -- so it holds on
+// a laptop and a shared runner alike.
 describe("matchesHardDeny - the argv rules stay linear", () => {
 	const shapes: [string, (n: number) => string][] = [
 		["repeated rm heads", (n) => `${"rm ".repeat(n)}-rf ./build`],
@@ -469,20 +472,45 @@ describe("matchesHardDeny - the argv rules stay linear", () => {
 		["a long wrapper option run", (n) => `xargs ${"-n 1 ".repeat(n)}printf`],
 		["repeated find exec clauses", (n) => `find . ${String.raw`-exec printf {} \; `.repeat(n)}`],
 	];
+	// 8x the budget this suite carried, which every shape cleared by an order of magnitude even on
+	// the slowest runner: a backstop against the floor getting slower, not a target to beat.
+	const CEILING_MS = 8000;
+	// The ratio compares an eighth of the size, not half of it. Cost here grows a little faster than
+	// linear (these shapes measure about n^1.1 to n^1.2), and the distance between that and a quadratic
+	// widens with the step -- it is step^(2-exp) -- so a step of 8 pulls a quadratic 2.8x away from the
+	// shapes instead of 1.4x. At that step a straight line costs 8 and a quadratic 64, so the bound of
+	// 32 sits between them: measured across the loop the worst shape costs 9.9 and the median 8.7.
 	for (const [label, build] of shapes) {
-		test(`${label} stays linear at 20000 tokens`, () => {
-			const started = Date.now();
-			bash(build(20000));
-			expect(Date.now() - started).toBeLessThan(1000);
-		});
+		test(
+			`${label} stays linear at 20000 tokens`,
+			() =>
+				expectScaling({
+					build,
+					run: bash,
+					size: 20000,
+					ceilingMs: CEILING_MS,
+					ratioPair: [2500, 20000],
+					maxRatio: 32,
+				}),
+			SCALING_TEST_TIMEOUT_MS,
+		);
 	}
-	// Each process substitution is tokenized as its own nested source, so this shape is read
-	// at a quarter of the token count to stay inside the bound on a slower runner.
-	test("repeated quoted process substitutions stay linear at 5000 substitutions", () => {
-		const started = Date.now();
-		bash(`tee ${">(c'a't) ".repeat(5000)}`);
-		expect(Date.now() - started).toBeLessThan(1000);
-	});
+	// Each process substitution is tokenized as its own nested source, so this shape is read at a
+	// quarter of the token count of the shapes above; the cost ratio does not care what that count
+	// is, so the workload stayed where it was.
+	test(
+		"repeated quoted process substitutions stay linear at 5000 substitutions",
+		() =>
+			expectScaling({
+				build: (count) => `tee ${">(c'a't) ".repeat(count)}`,
+				run: bash,
+				size: 5000,
+				ceilingMs: CEILING_MS,
+				ratioPair: [625, 5000],
+				maxRatio: 32,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("matchesHardDeny - tokenization does not widen into benign neighbors", () => {
@@ -760,11 +788,11 @@ describe("matchesHardDeny - patterns do not backtrack exponentially", () => {
 		["value opt with separate value", (n) => `git ${"--namespace x ".repeat(n)}`],
 	];
 	for (const [label, build] of shapes) {
-		test(`${label} stays linear at 1000 tokens`, () => {
-			const started = Date.now();
-			bash(build(1000));
-			expect(Date.now() - started).toBeLessThan(1000);
-		});
+		test(
+			`${label} stays linear at 1000 tokens`,
+			() => expectScaling({ build, run: bash, size: 1000, ceilingMs: 8000, ratioPair: [125, 1000], maxRatio: 32 }),
+			SCALING_TEST_TIMEOUT_MS,
+		);
 	}
 });
 
@@ -2837,11 +2865,19 @@ describe("matchesHardDeny - a pipe sink name rebound to a shell", () => {
 		expect(bash(`echo 'sed -n p /dev/null' | tee ${deep} >(/tmp/cat)`)).not.toBeNull();
 		expect(bash(`echo 'sed -n p /dev/null' | tee >(/tmp/cat) ${deep}`)).not.toBeNull();
 	});
-	test("stacked attached -S prefixes outside env stay bounded and keep other denials", () => {
-		const started = performance.now();
-		expect(bash(`sed -n p /dev/null; env ${"-S".repeat(20000)}true`)).not.toBeNull();
-		expect(performance.now() - started).toBeLessThan(2000);
-	});
+	test(
+		"stacked attached -S prefixes outside env stay bounded and keep other denials",
+		() =>
+			expectScaling({
+				build: (count) => `sed -n p /dev/null; env ${"-S".repeat(count)}true`,
+				run: (command) => expect(bash(command)).not.toBeNull(),
+				size: 20000,
+				ceilingMs: 16000,
+				ratioPair: [2500, 20000],
+				maxRatio: 32,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("matchesHardDeny - a path-named command given a shell eval flag", () => {
@@ -3057,12 +3093,25 @@ describe("matchesHardDeny - a function or alias that runs its unquoted operands"
 			expect(bash(command)).toBeNull();
 		}
 	});
-	test("a long chain of defined calls stays bounded", () => {
-		const started = performance.now();
-		expect(bash(`f() { "$@"; }; ${"f sudo ".repeat(20000)}sed -n p /dev/null`)).not.toBeNull();
-		expect(bash(`f() { "$@"; }; ${"f ".repeat(40000)}true`)).toBeNull();
-		expect(performance.now() - started).toBeLessThan(3000);
-	});
+	test(
+		"a long chain of defined calls stays bounded",
+		() =>
+			expectScaling({
+				build: (calls) => ({
+					denied: `f() { "$@"; }; ${"f sudo ".repeat(calls)}sed -n p /dev/null`,
+					allowed: `f() { "$@"; }; ${"f ".repeat(2 * calls)}true`,
+				}),
+				run: ({ denied, allowed }) => {
+					expect(bash(denied)).not.toBeNull();
+					expect(bash(allowed)).toBeNull();
+				},
+				size: 20000,
+				ceilingMs: 24000,
+				ratioPair: [2500, 20000],
+				maxRatio: 32,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("matchesHardDeny - an alias or function body that takes the call's operands", () => {
@@ -3269,24 +3318,37 @@ describe("matchesHardDeny - an alias or function body that takes the call's oper
 			expect(reason).not.toContain("analysis budget");
 		}
 	});
-	test("many calls and wide bodies stay bounded", () => {
-		const started = performance.now();
-		expect(bash(`alias g=git; ${"g status; ".repeat(5000)}`)).toBeNull();
-		expect(bash(`f() { rm "$@"; }; ${"f x; ".repeat(5000)}`)).toBeNull();
-		expect(bash(`f() { sudo "$@"; }; ${"f ".repeat(40000)}true`)).toBeNull();
-		const body = Array.from({ length: 1000 }, (_, k) => `rm "$@" a${k}; `).join("");
-		const calls = Array.from({ length: 1000 }, (_, k) => `f x${k}; `).join("");
-		expect(bash(`f() { ${body}}; ${calls}`)?.reason).toContain("analysis budget");
-		expect(bash(`f() { rm ${'"$@" '.repeat(20000)}; }; f ${"x ".repeat(20000)}`)?.reason).toContain(
-			"analysis budget",
-		);
-		const wideBody = Array.from({ length: 5000 }, (_, k) => `rm "$@" a${k}; `).join("");
-		expect(bash(`f() { ${wideBody}}; f ${"x ".repeat(20000)}`)?.reason).toContain("analysis budget");
-		expect(bash(`f() { rm "${"a$@".repeat(20000)}"; }; f ${"x ".repeat(20000)}`)?.reason).toContain(
-			"analysis budget",
-		);
-		expect(performance.now() - started).toBeLessThan(5000);
-	});
+	test(
+		"many calls and wide bodies stay bounded",
+		() =>
+			expectScaling({
+				build: (calls) => {
+					const body = Array.from({ length: calls / 5 }, (_, k) => `rm "$@" a${k}; `).join("");
+					const chain = Array.from({ length: calls / 5 }, (_, k) => `f x${k}; `).join("");
+					const wideBody = Array.from({ length: calls }, (_, k) => `rm "$@" a${k}; `).join("");
+					return {
+						allowed: [
+							`alias g=git; ${"g status; ".repeat(calls)}`,
+							`f() { rm "$@"; }; ${"f x; ".repeat(calls)}`,
+							`f() { sudo "$@"; }; ${"f ".repeat(8 * calls)}true`,
+						],
+						budgetExhausted: [
+							`f() { ${body}}; ${chain}`,
+							`f() { rm ${'"$@" '.repeat(4 * calls)}; }; f ${"x ".repeat(4 * calls)}`,
+							`f() { ${wideBody}}; f ${"x ".repeat(4 * calls)}`,
+							`f() { rm "${"a$@".repeat(4 * calls)}"; }; f ${"x ".repeat(4 * calls)}`,
+						],
+					};
+				},
+				run: ({ allowed, budgetExhausted }) => {
+					for (const command of allowed) expect(bash(command)).toBeNull();
+					for (const command of budgetExhausted) expect(bash(command)?.reason).toContain("analysis budget");
+				},
+				size: 5000,
+				ceilingMs: 40000,
+			}),
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("matchesHardDeny - env short-option clusters", () => {
@@ -5012,31 +5074,42 @@ describe("matchesHardDeny - a brace expansion in an operand", () => {
 		expect(matchesHardDeny("write", { path: "notes/.{e..e}nv", content: "x" }, RULES)).toBeNull();
 		expect(bash("echo x > notes/.{e..e}nv")).not.toBeNull();
 	});
-	test("brace-expanded operands and destinations stay linear", () => {
-		const product = "{a,b}".repeat(14);
-		for (const command of [
-			`echo x ${`> ${product} `.repeat(2000)}`,
-			`cp ${"src/{a,b}.ts ".repeat(20000)}/tmp`,
-			`rm -f ${"x{1..50}{a,b} ".repeat(5000)}`,
-			`git push origin ${`${product} `.repeat(2000)}`,
-			`echo ${`${product}{a,b} `.repeat(2000)}`,
-			`echo ${`${product}{a,b}{a,b} `.repeat(2000)}`,
-		]) {
-			const started = Date.now();
-			bash(command);
-			expect(Date.now() - started).toBeLessThan(3000);
-		}
-		const sequences = Array.from({ length: 300 }, (_, k) => `{10000..20000}X${k}`).join(" ");
-		for (const command of [`echo ${sequences}`, `rm -f ${sequences}`]) {
-			const started = Date.now();
-			bash(command);
-			expect(Date.now() - started).toBeLessThan(3000);
-		}
-		const array = `[${Array.from({ length: 30 }, (_, k) => `{"id":${k},"on":true}`).join(",")}]`;
-		const started = Date.now();
-		matchesHardDeny("notes", { text: `${array}\n`.repeat(2000) }, RULES);
-		expect(Date.now() - started).toBeLessThan(3000);
-	});
+	test(
+		"brace-expanded operands and destinations stay linear",
+		() => {
+			const product = "{a,b}".repeat(14);
+			const array = `[${Array.from({ length: 30 }, (_, k) => `{"id":${k},"on":true}`).join(",")}]`;
+			expectScaling({
+				build: (words) => {
+					const sequences = Array.from({ length: Math.round(0.15 * words) }, (_, k) => `{10000..20000}X${k}`).join(
+						" ",
+					);
+					return {
+						commands: [
+							`echo x ${`> ${product} `.repeat(words)}`,
+							`cp ${"src/{a,b}.ts ".repeat(10 * words)}/tmp`,
+							`rm -f ${"x{1..50}{a,b} ".repeat(Math.round(2.5 * words))}`,
+							`git push origin ${`${product} `.repeat(words)}`,
+							`echo ${`${product}{a,b} `.repeat(words)}`,
+							`echo ${`${product}{a,b}{a,b} `.repeat(words)}`,
+							`echo ${sequences}`,
+							`rm -f ${sequences}`,
+						],
+						text: `${array}\n`.repeat(words),
+					};
+				},
+				run: ({ commands, text }) => {
+					for (const command of commands) bash(command);
+					matchesHardDeny("notes", { text }, RULES);
+				},
+				size: 2000,
+				ceilingMs: 24000,
+				ratioPair: [250, 2000],
+				maxRatio: 32,
+			});
+		},
+		SCALING_TEST_TIMEOUT_MS,
+	);
 });
 
 describe("matchesHardDeny - shells beyond bash, dash, fish, ksh, sh and zsh", () => {
