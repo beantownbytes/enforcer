@@ -1,0 +1,226 @@
+name: release
+run-name: "release :: ${{ github.event.head_commit.message || github.ref_name }}"
+
+# Cuts a release for a commit on main: validate, bump the patch version, tag it, then
+# call build.yml to publish the binary. build.yml is called rather than triggered by
+# the tag because a GITHUB_TOKEN push starts no workflow run.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release per ref, and a release must never be superseded mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# The identity that authors the bump commit. The guard below matches this email, so
+# both places must change together.
+env:
+  CI_BOT_NAME: enforcer-ci
+  CI_BOT_EMAIL: enforcer-ci@users.noreply.github.com
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: assert main
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::release workflow only runs against main (got ${GITHUB_REF})"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: check
+        run: |
+          set -euo pipefail
+          # Anti-recursion applies only to the push the bump commit itself fires. A
+          # workflow_dispatch is always operator-initiated and must run, so the version
+          # job's rerun-safe path can recover a bump that pushed before its tag did.
+          subject="$(git log -1 --pretty=%s)"
+          author="$(git log -1 --pretty=%ae)"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] &&
+            { [ "$author" = "$CI_BOT_EMAIL" ] || printf '%s\n' "$subject" | grep -qE '^ci: bump VERSION to '; }; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The aggregate gate, not just `make test`: a release must carry the same fmt/type/lint
+  # guarantees as a merged PR. ci.yml owns that definition and already runs it on every main
+  # push and PR, but the bump commit gets no workflow run of its own (a GITHUB_TOKEN push
+  # starts none), so the release re-runs the same job in-run instead of trusting a past run's
+  # colour. One definition, called the same way build.yml is called.
+  gate:
+    needs: guard
+    if: ${{ needs.guard.outputs.skip != 'true' }}
+    uses: ./.github/workflows/ci.yml
+
+  version:
+    runs-on: ubuntu-latest
+    needs: gate
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      commit: ${{ steps.bump.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - name: bump, commit, tag, push (rerun-safe)
+        id: bump
+        run: |
+          set -euo pipefail
+          git config user.email "$CI_BOT_EMAIL"
+          git config user.name "$CI_BOT_NAME"
+          manifest=packages/enforcer/package.json
+
+          # Rerun-safe: if a prior run got as far as committing and pushing the bump but
+          # failed before the tag landed, reuse that version instead of bumping twice.
+          head_subject="$(git log -1 --pretty=%s)"
+          case "$head_subject" in
+            "ci: bump VERSION to "*)
+              new="${head_subject#"ci: bump VERSION to "}"
+              # The reuse path exists for a run that stopped between the bump commit and
+              # its tag, so the tree must still carry that same version. The Makefile owns
+              # how each version source is read and whether the two agree, so ask it rather
+              # than re-implementing the same comparison here.
+              if ! make -s version-check; then
+                echo "::error::HEAD is a bump commit whose two version sources disagree; refusing to reuse it"
+                exit 1
+              fi
+              # Agreeing with each other is not enough. Both must be the version the subject
+              # claims, or HEAD is some other release's bump commit and re-tagging it would
+              # publish a version nobody validated.
+              read -r _ tree_version _ <<<"$(make -s release-info)"
+              if [ "$tree_version" != "$new" ]; then
+                echo "::error::HEAD's subject claims $new but the tree is at $tree_version; refusing to reuse it"
+                exit 1
+              fi
+              echo "::notice::HEAD is already the bump commit for $new; ensuring the tag is pushed"
+              ;;
+            *)
+              [ -f VERSION ] || echo "0.1.0" > VERSION
+              read -r _ old _ <<<"$(make -s release-info)"
+              # No leading zeros: a component like 08 would pass a plain [0-9]+ pattern and
+              # then die inside the arithmetic below as an out-of-range octal literal, and
+              # forcing base 10 there would quietly turn 0.1.08 into the lower 0.1.9.
+              if ! printf '%s\n' "$old" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+                echo "::error::VERSION must match X.Y.Z with no leading zeros, got: $old"
+                exit 1
+              fi
+              IFS=. read -r MAJ MIN PAT <<<"$old"
+              new="$MAJ.$MIN.$((PAT + 1))"
+              # Refuse a collision before touching anything: a bump commit for a version
+              # whose tag already exists elsewhere could only ever be dead weight on main.
+              if git ls-remote --exit-code origin "refs/tags/v$new" >/dev/null 2>&1; then
+                echo "::error::tag v$new already exists on origin before this run cut it; refusing to release version $new over it"
+                exit 1
+              fi
+              printf '%s\n' "$new" > VERSION
+
+              # The binary reports the manifest version, so a release must move both files.
+              # Rewrite only the version field's value: re-serialising the manifest would
+              # change its indentation, and `make check` formats JSON files too.
+              # The $1/$2 below are regex replacement groups, not shell expansion.
+              # shellcheck disable=SC2016
+              NEW_VERSION="$new" PKG_MANIFEST="$manifest" bun -e '
+                const { readFileSync, writeFileSync } = require("node:fs");
+                const path = process.env.PKG_MANIFEST;
+                const source = readFileSync(path, "utf8");
+                const updated = source.replace(/(\n[ \t]*"version": ")[^"]*(")/, "$1" + process.env.NEW_VERSION + "$2");
+                if (updated === source) {
+                  console.error("no top-level version field found in " + path);
+                  process.exit(1);
+                }
+                writeFileSync(path, updated);
+              '
+              # Both version sources have to agree, and agree on $new. make version-check
+              # owns the first half; the release's own claim is the second half. The
+              # extractions live in the Makefile, not here.
+              if ! make -s version-check; then
+                echo "::error::the manifest rewrite did not leave VERSION and $manifest in agreement"
+                exit 1
+              fi
+              read -r _ info_version _ <<<"$(make -s release-info)"
+              if [ "$info_version" != "$new" ]; then
+                echo "::error::make release-info reports $info_version, expected $new"
+                exit 1
+              fi
+
+              git add VERSION "$manifest"
+              git commit -m "ci: bump VERSION to $new"
+              git push origin HEAD:main
+              ;;
+          esac
+
+          # Both paths end in $new, and the reuse path takes it from a commit subject, so
+          # validate it here rather than trusting whichever branch produced it.
+          if ! printf '%s\n' "$new" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::resolved version $new does not match X.Y.Z with no leading zeros"
+            exit 1
+          fi
+
+          # Idempotent tag handling, plus the agreement that makes it safe: the tag for this
+          # version must name the commit this run validated, locally and on origin. Without
+          # that, a reverted and re-cut bump or a hand-pushed tag carrying the same version
+          # would let the build publish a commit nothing tested.
+          built="$(git rev-parse HEAD)"
+          if ! git rev-parse -q --verify "refs/tags/v$new" >/dev/null; then
+            git tag "v$new"
+          fi
+          # Peeled, so an annotated tag names its commit: the thing being compared is always
+          # the commit the release would build, not a tag object.
+          local_tag="$(git rev-parse "refs/tags/v$new^{commit}")"
+          if [ "$local_tag" != "$built" ]; then
+            echo "::error::tag v$new names $local_tag but this run validated $built; refusing to release a commit it did not test"
+            exit 1
+          fi
+          # No ref pattern here on purpose: `git ls-remote origin refs/tags/X` omits the
+          # `refs/tags/X^{}` peel line that names an annotated tag's commit, which would make a
+          # good annotated tag look like a disagreement. List everything and match exactly.
+          remote_lines="$(git ls-remote origin)"
+          remote_tag="$(printf '%s\n' "$remote_lines" | awk -v ref="refs/tags/v$new" -v peel="refs/tags/v$new^{}" '
+            $2 == peel { peeled = $1 }
+            $2 == ref { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }
+          ')"
+          if [ -n "$remote_tag" ]; then
+            if [ "$remote_tag" != "$built" ]; then
+              echo "::error::tag v$new already exists on origin at $remote_tag, but this run validated $built; refusing to release a commit it did not test"
+              exit 1
+            fi
+            echo "::notice::tag v$new is already on origin at $built"
+          else
+            git push origin "v$new"
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      tag: v${{ needs.version.outputs.version }}
+      # The commit this run tested and tagged. build.yml resolves the tag peeled and refuses
+      # to build anything else, so a tag moved between these two jobs cannot ship a commit
+      # nothing checked.
+      commit: ${{ needs.version.outputs.commit }}

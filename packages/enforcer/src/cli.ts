@@ -14,10 +14,12 @@
  */
 
 import { loadRules, matchesHardDeny } from "./index.js";
+import { ENFORCER_VERSION } from "./version.js";
 
 const HELP = `enforcer -- deterministic tool-call deny floor with redirects
 
 usage: enforcer [--harness generic|claude]
+       enforcer --version
 
 Reads a tool call as JSON on stdin and writes a verdict as JSON on stdout.
 
@@ -28,6 +30,9 @@ Reads a tool call as JSON on stdin and writes a verdict as JSON on stdout.
   --harness claude
     in:  claude PreToolUse payload {"tool_name":"Bash","tool_input":{...}}
     out: {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}
+
+  --version, -V
+    print "enforcer <version>" and exit 0 without reading stdin.
 
 Rules: the built-in floor plus any regex redirects in $ENFORCER_RULES
 (default ~/.config/enforcer/rules.jsonc). Exit 0 on a verdict, 2 on a usage error.`;
@@ -69,6 +74,11 @@ function fail(message: string): never {
 
 async function main(): Promise<void> {
 	const args = process.argv.slice(2);
+	// --version answers before stdin is read, so it works from a pipe or a bare shell.
+	if (args.includes("--version") || args.includes("-V")) {
+		process.stdout.write(`enforcer ${ENFORCER_VERSION}\n`);
+		return;
+	}
 	if (args.includes("--help") || args.includes("-h")) {
 		process.stdout.write(`${HELP}\n`);
 		return;

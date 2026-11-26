@@ -1,6 +1,6 @@
 {
 	"name": "@enforcer/core",
-	"version": "0.1.0",
+	"version": "0.1.58",
 	"description": "Deterministic tool-call deny floor with tool-substitution redirects (sed->slice/rg, awk-writes, rm -rf /, git push --force, secret-writes, curl|sh). Pure, no LLM, harness-agnostic. Consumed by the claude PreToolUse hook and the @enforcer/pi-enforcer extension.",
 	"type": "module",
 	"main": "./src/index.ts",
