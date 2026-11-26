@@ -35,6 +35,7 @@ jobs:
     steps:
       - name: assert main
         run: |
+          set -euo pipefail
           if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
             echo "::error::release workflow only runs against main (got ${GITHUB_REF})"
             exit 1
@@ -44,6 +45,7 @@ jobs:
           fetch-depth: 2
       - id: check
         run: |
+          set -euo pipefail
           # Anti-recursion applies only to the push the bump commit itself fires. A
           # workflow_dispatch is always operator-initiated and must run, so the version
           # job's rerun-safe path can recover a bump that pushed before its tag did.
@@ -110,6 +112,11 @@ jobs:
                 echo "::error::HEAD's subject claims $new but VERSION says $tree_version; refusing to reuse it"
                 exit 1
               fi
+              reported="$(grep -m1 '"version"' "$manifest" | cut -d'"' -f4)"
+              if [ "$reported" != "$new" ]; then
+                echo "::error::HEAD's subject claims $new but $manifest reports $reported; refusing to reuse it"
+                exit 1
+              fi
               echo "::notice::HEAD is already the bump commit for $new; ensuring the tag is pushed"
               ;;
             *)
@@ -166,11 +173,27 @@ jobs:
             exit 1
           fi
 
-          # Idempotent tag handling: create locally if missing, push if the remote lacks it.
+          # Idempotent tag handling, plus the agreement that makes it safe: the tag for this
+          # version must name the commit this run validated, locally and on origin. Without
+          # that, a reverted and re-cut bump or a hand-pushed tag carrying the same version
+          # would let the build publish a commit nothing tested.
+          built="$(git rev-parse HEAD)"
           if ! git rev-parse -q --verify "refs/tags/v$new" >/dev/null; then
             git tag "v$new"
           fi
-          if ! git ls-remote --tags origin "v$new" | grep -q "v$new"; then
+          local_tag="$(git rev-parse "refs/tags/v$new")"
+          if [ "$local_tag" != "$built" ]; then
+            echo "::error::tag v$new names $local_tag but this run validated $built; refusing to release a commit it did not test"
+            exit 1
+          fi
+          remote_tag="$(git ls-remote --tags origin | awk -v ref="refs/tags/v$new" '$2 == ref { print $1; exit }')"
+          if [ -n "$remote_tag" ]; then
+            if [ "$remote_tag" != "$built" ]; then
+              echo "::error::tag v$new already exists on origin at $remote_tag, but this run validated $built; refusing to release a commit it did not test"
+              exit 1
+            fi
+            echo "::notice::tag v$new is already on origin at $built"
+          else
             git push origin "v$new"
           fi
           echo "version=$new" >> "$GITHUB_OUTPUT"

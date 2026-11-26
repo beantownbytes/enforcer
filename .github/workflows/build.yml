@@ -80,7 +80,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$PREV" ] && [ "$PREV" != "$TAG" ]; then
-            CHANGELOG="$(git log --pretty='format:- %s (%h)' --invert-grep --grep='^ci: bump VERSION' "$PREV..$TAG" | head -200)"
+            CHANGELOG="$(git log --no-merges --pretty='format:- %s (%h)' --invert-grep --grep='^ci: bump VERSION' "$PREV..$TAG" | head -200)"
             [ -n "$CHANGELOG" ] || CHANGELOG="No user-visible changes since $PREV."
           else
             CHANGELOG="Initial release."
@@ -89,10 +89,14 @@ jobs:
           printf '%s\n' "$CHANGELOG" > "$NOTES_FILE"
           # Found -> update; "release not found" -> create; anything else is fatal so auth
           # and permission errors surface instead of looking like a missing release.
+          # A new release starts as a draft: it goes live only once the build job has
+          # compiled and verified an asset, so a failed build cannot leave a published
+          # release with notes and nothing attached. Editing an existing release leaves its
+          # published state alone, so rebuilding a shipped tag does not unpublish it.
           if gh release view "$TAG" > /dev/null 2> "$RUNNER_TEMP/view.err"; then
             gh release edit "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
           elif grep -qi 'release not found' "$RUNNER_TEMP/view.err"; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$NOTES_FILE"
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --notes-file "$NOTES_FILE"
           else
             echo "::error::release lookup failed: $(cat "$RUNNER_TEMP/view.err")"
             exit 1
@@ -156,6 +160,8 @@ jobs:
             exit 1
           fi
           echo "uploaded $uploaded asset(s) for $TARGET"
+          # The release goes live only with a verified asset attached to it.
+          gh release edit "$TAG" --draft=false
 
   prune:
     runs-on: ubuntu-latest
@@ -175,7 +181,10 @@ jobs:
             echo "::error::KEEP_RELEASES must be a positive integer, got: $KEEP_RELEASES"
             exit 1
           fi
-          all_tags="$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName')"
+          # Ordered by version, not by the list's creation-date order: dispatching a rebuild
+          # of an old tag stamps it as newly created, which by date alone would evict the
+          # release that is actually current.
+          all_tags="$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName' | sort -rV)"
           if [ -z "$all_tags" ]; then
             echo "no releases found; nothing to prune"
             exit 0
