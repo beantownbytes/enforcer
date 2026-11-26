@@ -128,6 +128,12 @@ jobs:
               fi
               IFS=. read -r MAJ MIN PAT <<<"$old"
               new="$MAJ.$MIN.$((PAT + 1))"
+              # Refuse a collision before touching anything: a bump commit for a version
+              # whose tag already exists elsewhere could only ever be dead weight on main.
+              if git ls-remote --exit-code origin "refs/tags/v$new" >/dev/null 2>&1; then
+                echo "::error::tag v$new already exists on origin before this run cut it; refusing to release version $new over it"
+                exit 1
+              fi
               printf '%s\n' "$new" > VERSION
 
               # The binary reports the manifest version, so a release must move both files.
@@ -181,12 +187,22 @@ jobs:
           if ! git rev-parse -q --verify "refs/tags/v$new" >/dev/null; then
             git tag "v$new"
           fi
-          local_tag="$(git rev-parse "refs/tags/v$new")"
+          # Peeled, so an annotated tag names its commit: the thing being compared is always
+          # the commit the release would build, not a tag object.
+          local_tag="$(git rev-parse "refs/tags/v$new^{commit}")"
           if [ "$local_tag" != "$built" ]; then
             echo "::error::tag v$new names $local_tag but this run validated $built; refusing to release a commit it did not test"
             exit 1
           fi
-          remote_tag="$(git ls-remote --tags origin | awk -v ref="refs/tags/v$new" '$2 == ref { print $1; exit }')"
+          # No ref pattern here on purpose: `git ls-remote origin refs/tags/X` omits the
+          # `refs/tags/X^{}` peel line that names an annotated tag's commit, which would make a
+          # good annotated tag look like a disagreement. List everything and match exactly.
+          remote_lines="$(git ls-remote origin)"
+          remote_tag="$(printf '%s\n' "$remote_lines" | awk -v ref="refs/tags/v$new" -v peel="refs/tags/v$new^{}" '
+            $2 == peel { peeled = $1 }
+            $2 == ref { direct = $1 }
+            END { print (peeled != "" ? peeled : direct) }
+          ')"
           if [ -n "$remote_tag" ]; then
             if [ "$remote_tag" != "$built" ]; then
               echo "::error::tag v$new already exists on origin at $remote_tag, but this run validated $built; refusing to release a commit it did not test"

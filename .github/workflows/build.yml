@@ -160,10 +160,11 @@ jobs:
             exit 1
           fi
           echo "uploaded $uploaded asset(s) for $TARGET"
-          # The release goes live only with a verified asset attached to it.
-          gh release edit "$TAG" --draft=false
 
-  prune:
+  # Publishing is its own job so it happens once every matrix leg has compiled, verified the
+  # version the binary prints, and attached its asset. Doing it in the build job would publish
+  # after the first leg finished while another leg was still building.
+  publish:
     runs-on: ubuntu-latest
     needs: [resolve, build]
     if: ${{ needs.build.result == 'success' }}
@@ -172,7 +173,32 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: publish the release now that its assets are verified
+        run: |
+          set -euo pipefail
+          # Flipping an already published release is a no-op, so rebuilding a shipped tag is
+          # safe; only a draft this run created goes live here.
+          is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          if [ "$is_draft" = "true" ]; then
+            gh release edit "$TAG" --draft=false
+            echo "published $TAG"
+          else
+            echo "$TAG is already published; nothing to publish"
+          fi
+
+  prune:
+    runs-on: ubuntu-latest
+    needs: [resolve, build, publish]
+    if: ${{ needs.publish.result == 'success' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
       KEEP_RELEASES: ${{ vars.KEEP_RELEASES || '5' }}
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       - name: prune old releases (keep the newest $KEEP_RELEASES; tags untouched)
         run: |
@@ -195,6 +221,13 @@ jobs:
           # Tag names carry no whitespace, so the word split here is the point.
           # shellcheck disable=SC2086
           for tag in $all_tags; do
+            # The release this run produced is never a prune candidate, whichever position the
+            # version ordering puts it in: dispatching a rebuild of an old tag must not delete
+            # the release that rebuild just made, and keeping by version must never be able to
+            # evict the release currently being cut.
+            if [ "$tag" = "$TAG" ]; then
+              continue
+            fi
             i=$((i + 1))
             if [ "$i" -le "$KEEP_RELEASES" ]; then
               continue
@@ -207,4 +240,4 @@ jobs:
               failed=$((failed + 1))
             fi
           done
-          echo "prune summary: kept $KEEP_RELEASES, deleted $deleted, failed $failed"
+          echo "prune summary: kept $KEEP_RELEASES plus $TAG, deleted $deleted, failed $failed"
