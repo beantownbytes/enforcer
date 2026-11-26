@@ -240,6 +240,30 @@ describe("cli - version", () => {
 		expect(r.stdout).toBe(`enforcer ${repoVersion()}\n`);
 	});
 
+	test("--version answers while stdin is still open", async () => {
+		// A release job captures this answer with $(./dist/enforcer-linux-amd64 --version) and
+		// a person runs it at a terminal, in both cases with stdin open and never closed. The
+		// tests above go through runCli(), which closes stdin immediately, so a version check
+		// that moved below the stdin read would still pass them. This one leaves the pipe open:
+		// that regression hangs here instead of hanging a release job until it times out.
+		const child = Bun.spawn([process.execPath, CLI, "--version"], {
+			cwd: join(import.meta.dir, ".."),
+			env: { ...process.env, ENFORCER_RULES: join(tmp, "absent.jsonc") },
+			stdin: "pipe",
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const exited = await Promise.race([
+			child.exited.then((code) => ({ code, hung: false })),
+			Bun.sleep(2000).then(() => ({ code: null, hung: true })),
+		]);
+		child.stdin.end();
+		if (exited.hung) child.kill();
+		expect(exited.hung).toBe(false);
+		expect(exited.code).toBe(0);
+		expect(await streamText(child.stdout)).toBe(`enforcer ${repoVersion()}\n`);
+	});
+
 	test("the packaged version equals the repository VERSION file", () => {
 		expect(ENFORCER_VERSION).toBe(repoVersion());
 	});

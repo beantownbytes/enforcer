@@ -10,11 +10,26 @@ on:
         description: "Tag to (re)build, e.g. v0.1.59"
         required: true
         type: string
+      # The commit the caller validated. When present, the tag must name exactly this
+      # commit, so a tag moved between the caller's checks and this run's checkout cannot
+      # quietly change what gets published.
+      commit:
+        description: "Commit the tag must name, as validated by the caller"
+        required: false
+        type: string
+        default: ""
+  # A dispatch carries no validated commit, so it publishes the tag it is given as-is. That
+  # is the documented exemption from "never publish what the pipeline did not test": a manual
+  # rebuild is operator intent, the same as running gh release create directly.
   workflow_dispatch:
     inputs:
       tag:
         description: "Tag to (re)build, e.g. v0.1.59"
         required: true
+        type: string
+      commit:
+        description: "Commit the tag must name (optional guard for a manual rebuild)"
+        required: false
         type: string
 
 permissions:
@@ -37,6 +52,7 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       version: ${{ steps.r.outputs.version }}
       prev_tag: ${{ steps.r.outputs.prev_tag }}
+      commit: ${{ steps.r.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,13 +60,14 @@ jobs:
       - id: r
         env:
           TAG_INPUT: ${{ inputs.tag }}
+          COMMIT_INPUT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
           # Always the input, never GITHUB_REF_NAME: a called run has ref main, so only
           # the input resolves the same way for a called run and a manual rebuild.
           tag="$TAG_INPUT"
-          if ! printf '%s\n' "$tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::tag must match v<major>.<minor>.<patch>, got: $tag"
+          if ! printf '%s\n' "$tag" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "::error::tag must match v<major>.<minor>.<patch> with no leading zeros, got: $tag"
             exit 1
           fi
           # Resolve the tag exactly, and never from a checkout that happened not to
@@ -63,12 +80,23 @@ jobs:
             echo "::error::tag $tag does not exist on origin"
             exit 1
           fi
+          # Peeled, so an annotated tag resolves to the commit a build would compile. This is
+          # the commit every later job checks out, and the answer to the guard in release.yml
+          # that stops at tag time: without it, a tag moved after the caller's checks would
+          # silently change what this run builds, uploads, and publishes.
+          commit="$(git rev-parse "refs/tags/$tag^{commit}")"
+          if [ -n "$COMMIT_INPUT" ] && [ "$commit" != "$COMMIT_INPUT" ]; then
+            echo "::error::tag $tag names $commit but the caller validated $COMMIT_INPUT; refusing to build a commit it did not test"
+            exit 1
+          fi
+          echo "resolved $tag to $commit"
           # prev is the requested tag's predecessor in version order, so rebuilding an
           # older tag diffs against the release that came before it, not a newer one.
-          prev="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | awk -v want="$tag" 'seen && !done { prev = $0; done = 1 } $0 == want { seen = 1 } END { if (done) print prev }' || true)"
+          prev="$(git tag --list 'v*' --sort=-v:refname | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | awk -v want="$tag" 'seen && !done { prev = $0; done = 1 } $0 == want { seen = 1 } END { if (done) print prev }' || true)"
           {
             echo "tag=$tag"
             echo "version=${tag#v}"
+            echo "commit=$commit"
             echo "prev_tag=$prev"
           } >> "$GITHUB_OUTPUT"
       - name: create or update the release
@@ -80,7 +108,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$PREV" ] && [ "$PREV" != "$TAG" ]; then
-            CHANGELOG="$(git log --no-merges --pretty='format:- %s (%h)' --invert-grep --grep='^ci: bump VERSION' "$PREV..$TAG" | head -200)"
+            CHANGELOG="$(git log --no-merges -n 200 --pretty='format:- %s (%h)' --invert-grep --grep='^ci: bump VERSION' "$PREV..$TAG")"
             [ -n "$CHANGELOG" ] || CHANGELOG="No user-visible changes since $PREV."
           else
             CHANGELOG="Initial release."
@@ -117,7 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.tag }}
+          ref: ${{ needs.resolve.outputs.commit }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.4.2"

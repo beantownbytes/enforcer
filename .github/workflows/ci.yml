@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml calls this job as its release gate instead of re-declaring the steps, because
+  # the bump commit gets no workflow run of its own (a GITHUB_TOKEN push starts none) and the
+  # release must run the same gate the merge did.
+  workflow_call:
 
 # A check-only job needs no write scope, and this runs fork PRs on a public repo,
 # where the token scope otherwise comes from the repository default.

@@ -19,6 +19,7 @@ PI := packages/pi
 VERSION := $(shell tr -d '[:space:]' < VERSION 2>/dev/null || echo 0.0.0)
 PKG_VERSION := $(shell grep -m1 '"version"' $(ENFORCER)/package.json | cut -d'"' -f4)
 GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+COMPILE := cd $(ENFORCER) && bun x bun build src/cli.ts --compile
 
 help: ## Print this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "Targets:\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
@@ -46,7 +47,7 @@ check: fmt-check typecheck lint test ## fmt-check + typecheck + lint + test. Pre
 
 build: version-check ## Compile the enforcer binary to dist/enforcer (bun single-file executable).
 	mkdir -p dist
-	cd $(ENFORCER) && bun x bun build src/cli.ts --compile --outfile ../../dist/enforcer
+	$(COMPILE) --outfile ../../dist/enforcer
 
 version-check: ## Fail when VERSION and the version compiled into the binary disagree.
 	@test "$(VERSION)" = "$(PKG_VERSION)" || { \
@@ -56,7 +57,7 @@ version-check: ## Fail when VERSION and the version compiled into the binary dis
 
 build-linux-amd64: version-check ## Cross-compile the release binary to dist/enforcer-linux-amd64.
 	mkdir -p dist
-	cd $(ENFORCER) && bun x bun build src/cli.ts --compile --target=bun-linux-x64 --outfile ../../dist/enforcer-linux-amd64
+	$(COMPILE) --target=bun-linux-x64 --outfile ../../dist/enforcer-linux-amd64
 
 release-info: ## Print "<bin> <version> <sha>" on one line for the release pipeline.
 	@echo "enforcer $(VERSION) $(GIT_SHA)"
