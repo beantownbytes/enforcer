@@ -1,0 +1,34 @@
+name: ci
+run-name: "ci :: ${{ github.event.head_commit.message || github.ref_name }}"
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A check-only job needs no write scope, and this runs fork PRs on a public repo,
+# where the token scope otherwise comes from the repository default.
+permissions:
+  contents: read
+
+# PR churn supersedes stale runs; a main push is the merge run and must finish, so
+# cancel-in-progress is PR-only.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # bun, not a node container image: this is a bun workspace
+      # (packages/enforcer + packages/pi).
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+      - run: make bootstrap
+      - run: make check

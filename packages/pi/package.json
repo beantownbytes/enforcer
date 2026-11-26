@@ -1,0 +1,42 @@
+{
+	"name": "@enforcer/pi-enforcer",
+	"version": "0.1.0",
+	"description": "Standalone pi extension that applies enforcer's deterministic hard-deny floor to agent tool calls (no LLM judge, no approval prompts). Consumes @enforcer/core.",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pi-coding-agent",
+		"permissions",
+		"hard-deny"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/beantownbytes/enforcer.git"
+	},
+	"main": "./index.ts",
+	"exports": {
+		".": "./index.ts"
+	},
+	"files": [
+		"index.ts",
+		"src"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"lint": "biome check .",
+		"test": "bun test"
+	},
+	"dependencies": {
+		"@enforcer/core": "workspace:*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.85.1"
+	}
+}

@@ -1,0 +1,7 @@
+// Optional user redirects, appended to the built-in deny floor. Copy to
+// ~/.config/enforcer/rules.jsonc (or point $ENFORCER_RULES at it).
+// Each entry is a regex scanned against the raw command; `flags` defaults to "i".
+[
+	// Example: nudge a bare `cat file | grep` toward ripgrep.
+	// { "pattern": "\\bcat\\s+\\S+\\s*\\|\\s*grep\\b", "reason": "use rg <pattern> <file> instead of cat | grep" }
+]
