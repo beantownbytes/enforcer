@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ENFORCER_VERSION } from "../src/version.js";
 
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 const RM_REASON = "recursive/force delete targeting /, ~, $HOME or *";
@@ -217,6 +218,36 @@ describe("cli - claude hook verdicts", () => {
 				permissionDecisionReason: "git push --force",
 			},
 		});
+	});
+});
+
+describe("cli - version", () => {
+	// The repository VERSION file is what the release pipeline bumps; the compiled
+	// binary reports the package manifest. This is the seam that keeps a release tag,
+	// the file, and the shipped binary's own answer in agreement.
+	const repoVersion = () => readFileSync(join(import.meta.dir, "..", "..", "..", "VERSION"), "utf8").trim();
+
+	test("--version prints the packaged version and exits without stdin", async () => {
+		const r = await runCli("", ["--version"]);
+		expect(r.code).toBe(0);
+		expect(r.stderr).toBe("");
+		expect(r.stdout).toBe(`enforcer ${repoVersion()}\n`);
+	});
+
+	test("-V is the same surface as --version", async () => {
+		const r = await runCli("", ["-V"]);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe(`enforcer ${repoVersion()}\n`);
+	});
+
+	test("the packaged version equals the repository VERSION file", () => {
+		expect(ENFORCER_VERSION).toBe(repoVersion());
+	});
+
+	test("--version wins over a --harness argument that would otherwise be a usage error", async () => {
+		const r = await runCli("", ["--version", "--harness", "bogus"]);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe(`enforcer ${repoVersion()}\n`);
 	});
 });
 
